@@ -5,7 +5,7 @@
 // @version      1.0
 // @description  UI Panel to automate Create Time Off in Amazon Vibe
 // @author       Yalnunez
-// @match        https://vibe.a2z.com/scheduling/timeOff/createTimeOff*
+// @match        https://vibe.a2z.com/*
 // @updateURL    https://raw.githubusercontent.com/yalnunez/Stitch/main/stitch.user.js
 // @downloadURL  https://raw.githubusercontent.com/yalnunez/Stitch/main/stitch.user.js
 // @grant        GM_addStyle
