@@ -1,11 +1,13 @@
 
 // ==UserScript==
-// @name          Stitch Time Off Bot
+// @name         Stitch Time Off Bot
 // @namespace    http://tampermonkey.net/
 // @version      1.0
 // @description  UI Panel to automate Create Time Off in Amazon Vibe
 // @author       Yalnunez
 // @match        https://vibe.a2z.com/scheduling/timeOff/createTimeOff*
+// @updateURL    https://raw.githubusercontent.com/yalnunez/Stitch/main/stitch.user.js
+// @downloadURL  https://raw.githubusercontent.com/yalnunez/Stitch/main/stitch.user.js
 // @grant        GM_addStyle
 // @run-at       document-idle
 // ==/UserScript==
@@ -362,7 +364,7 @@
         var header = document.createElement('div');
         header.className = 'panel-header';
         var title = document.createElement('h3');
-        title.textContent = '⚡ Time Off v1.0';
+        title.textContent = '⚡ Stitch Time Off v1.0';
         header.appendChild(title);
         var controls = document.createElement('div');
         controls.className = 'controls';
