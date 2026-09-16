@@ -19,9 +19,9 @@
     // ⚙️ CONFIG
     // ============================================================
     var DELAY_BETWEEN_STEPS = 1000;
-    var DELAY_AFTER_SCHEDULE = 4000;
-    var DELAY_AFTER_SUBMIT = 3000;
-    var DELAY_AFTER_EDIT = 5000;
+    var DELAY_AFTER_SCHEDULE = 2000;
+    var DELAY_AFTER_SUBMIT = 5000;
+    var DELAY_AFTER_EDIT = 2000;
     var DELAY_DROPDOWN_OPEN = 2000;
     var DELAY_DROPDOWN_FILTER = 2000;
     var isProcessing = false;
@@ -706,7 +706,7 @@
 
     setTimeout(function () {
         createPanel();
-        addLog('🟢 v2.0 ready — All dropdowns tested & confirmed', 'info');
+        addLog('🟢 v1.0 ready — All dropdowns tested & confirmed', 'info');
         addLog('💡 Paste data, Validate, then Process.', 'info');
     }, 2000);
 
