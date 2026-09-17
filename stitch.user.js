@@ -1,8 +1,7 @@
-
 // ==UserScript==
 // @name         Stitch Time Off Bot
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  UI Panel to automate Create Time Off in Amazon Vibe
 // @author       Yalnunez
 // @match        https://vibe.a2z.com/*
@@ -20,12 +19,75 @@
     // ============================================================
     var DELAY_BETWEEN_STEPS = 1000;
     var DELAY_AFTER_SCHEDULE = 2000;
-    var DELAY_AFTER_SUBMIT = 5000;
+    var DELAY_AFTER_SUBMIT = 3000;
     var DELAY_AFTER_EDIT = 2000;
     var DELAY_DROPDOWN_OPEN = 2000;
     var DELAY_DROPDOWN_FILTER = 2000;
+    var MAX_CUSTOM_DURATION_RETRIES = 2;
     var isProcessing = false;
     var shouldStop = false;
+    var failedRecords = []; // Track failed records for final report
+
+    // ============================================================
+    // 🛡️ ANTI-THROTTLE: Keep timers alive in background tabs
+    // ============================================================
+    // Browsers throttle setTimeout/setInterval in background tabs.
+    // Strategy: try Web Worker first; if CSP blocks it, fall back
+    // to MessageChannel (not throttled). Only patch setTimeout
+    // AFTER confirming the alternative timer actually works.
+
+    (function installAntiThrottle() {
+        var _nativeSetTimeout = window.setTimeout.bind(window);
+        var _nativeClearTimeout = window.clearTimeout.bind(window);
+        var _nativeSetInterval = window.setInterval.bind(window);
+        var _nativeClearInterval = window.clearInterval.bind(window);
+
+        // --- MessageChannel-based anti-throttle ---
+        // MessageChannel.port.postMessage is NOT throttled in background
+        // tabs, unlike setTimeout. We use it to create a fast timer.
+        var pendingCallbacks = {};
+        var nextTimerId = 1;
+        var channel = new MessageChannel();
+
+        channel.port1.onmessage = function (evt) {
+            var id = evt.data.id;
+            if (pendingCallbacks[id]) {
+                var cb = pendingCallbacks[id];
+                delete pendingCallbacks[id];
+                cb();
+            }
+        };
+        channel.port1.start();
+        channel.port2.start();
+
+        // Patched setTimeout: uses native setTimeout for the delay,
+        // but fires the callback via MessageChannel so it isn't
+        // delayed further by background-tab throttling.
+        window.setTimeout = function stitchSetTimeout(fn, delayMs) {
+            if (typeof fn !== 'function') {
+                return _nativeSetTimeout(fn, delayMs);
+            }
+            delayMs = delayMs || 0;
+            var id = nextTimerId++;
+
+            pendingCallbacks[id] = fn;
+            // Use native setTimeout for the delay portion, then
+            // hand off to MessageChannel for the actual callback
+            _nativeSetTimeout(function () {
+                if (pendingCallbacks[id]) {
+                    channel.port2.postMessage({ id: id });
+                }
+            }, delayMs);
+            return id;
+        };
+
+        window.clearTimeout = function stitchClearTimeout(id) {
+            if (pendingCallbacks[id]) delete pendingCallbacks[id];
+            _nativeClearTimeout(id);
+        };
+
+        console.log('[Stitch] 🛡️ Anti-throttle installed (MessageChannel) — background tabs supported');
+    })();
 
     // ============================================================
     // 🛠️ UTILITIES
@@ -69,21 +131,22 @@
         var labels = document.querySelectorAll('label, span[class*="label"]');
         for (var i = 0; i < labels.length; i++) {
             var label = labels[i];
+            var input;
             if (label.textContent.trim().toLowerCase().includes(labelText.toLowerCase())) {
                 if (label.htmlFor) {
-                    var input = document.getElementById(label.htmlFor);
+                    input = document.getElementById(label.htmlFor);
                     if (input) return input;
                 }
                 var container = label.closest('[class*="formField"], [class*="child"], [class*="root"]');
                 if (container) {
-                    var input = container.querySelector('input[type="text"], input:not([type="hidden"]):not([type="checkbox"])');
+                    input = container.querySelector('input[type="text"], input:not([type="hidden"]):not([type="checkbox"])');
                     if (input) return input;
                 }
                 var parent = label.parentElement;
                 if (parent) {
                     var sibling = parent.nextElementSibling;
                     while (sibling) {
-                        var input = sibling.querySelector('input[type="text"], input:not([type="hidden"]):not([type="checkbox"])');
+                        input = sibling.querySelector('input[type="text"], input:not([type="hidden"]):not([type="checkbox"])');
                         if (input) return input;
                         sibling = sibling.nextElementSibling;
                     }
@@ -206,12 +269,13 @@
     }
 
     // ============================================================
-    // 🎯 CUSTOM DURATION SELECT
-    // NO search — uses Focus + Space + ArrowDown + Enter
-    // Tested and confirmed: Test B worked.
+    // 🎯 CUSTOM DURATION SELECT — WITH RETRY LOGIC
+    // Retry up to MAX_CUSTOM_DURATION_RETRIES times.
+    // Each failure resets the form via Edit button before retrying.
+    // Returns { success: boolean, retriesUsed: number }
     // ============================================================
 
-    async function selectCustomDuration() {
+    async function attemptSelectCustomDuration() {
         // Find the duration trigger button
         var triggerBtn = null;
         var allBtns = document.querySelectorAll('button[class*="button-trigger"]');
@@ -271,6 +335,55 @@
             addLog('  ❌ Duration still shows: "' + (verifyBtn ? verifyBtn.textContent.trim() : 'unknown') + '"', 'error');
             return false;
         }
+    }
+
+    async function selectCustomDurationWithRetry(record, index, total) {
+        for (var attempt = 1; attempt <= MAX_CUSTOM_DURATION_RETRIES; attempt++) {
+            var success = await attemptSelectCustomDuration();
+            if (success) return true;
+
+            addLog('  🔁 Custom Duration failed (attempt ' + attempt + '/' + MAX_CUSTOM_DURATION_RETRIES + ') — resetting via Edit...', 'warn');
+
+            // Reset the form via Edit
+            var editOk = await clickEditToReset();
+            if (!editOk) {
+                addLog('  ❌ Edit reset failed during retry', 'error');
+                return false;
+            }
+
+            // If we still have retries left, re-fill the form up to Show Schedule
+            if (attempt < MAX_CUSTOM_DURATION_RETRIES) {
+                addLog('  🔄 Re-filling form for retry...', 'info');
+                try {
+                    await fillField('User login', record.login);
+                    addLog('  ✅ Login: ' + record.login, 'success');
+                    await delay(DELAY_BETWEEN_STEPS);
+
+                    var catOk = await selectCategory(record.category);
+                    if (!catOk) throw new Error('Category re-fill failed');
+                    await delay(DELAY_BETWEEN_STEPS);
+
+                    await fillField('Start Date', record.startDate);
+                    addLog('  ✅ Start Date: ' + record.startDate, 'success');
+                    await delay(DELAY_BETWEEN_STEPS);
+
+                    await fillField('End Date', record.endDate);
+                    addLog('  ✅ End Date: ' + record.endDate, 'success');
+                    await delay(DELAY_BETWEEN_STEPS);
+
+                    await clickBtn('Show Schedule');
+                    addLog('  ✅ Show Schedule', 'success');
+                    await delay(DELAY_AFTER_SCHEDULE);
+                } catch (e) {
+                    addLog('  ❌ Re-fill failed: ' + e.message, 'error');
+                    return false;
+                }
+            }
+        }
+
+        // All retries exhausted
+        addLog('  ❌ Custom Duration failed after ' + MAX_CUSTOM_DURATION_RETRIES + ' attempts — skipping record', 'error');
+        return false;
     }
 
     // ============================================================
@@ -355,7 +468,11 @@
             '#vibe-timeoff-panel .log-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}' +
             '#vibe-timeoff-panel .log-header label{margin-bottom:0}' +
             '#vibe-timeoff-panel .btn-export{background:#2A3F55;border:none;color:#E0E0E0;padding:4px 10px;border-radius:6px;font-size:10px;font-weight:600;cursor:pointer;text-transform:uppercase;letter-spacing:.3px}' +
-            '#vibe-timeoff-panel.minimized .panel-body{display:none}'
+            '#vibe-timeoff-panel.minimized .panel-body{display:none}' +
+            '#vibe-timeoff-panel .failed-report{background:#1A0A0A;border:1px solid #FF5252;border-radius:8px;padding:10px;margin-top:10px;font-size:11px;line-height:1.6;display:none}' +
+            '#vibe-timeoff-panel .failed-report h4{margin:0 0 6px 0;color:#FF5252;font-size:12px}' +
+            '#vibe-timeoff-panel .failed-report .failed-item{color:#FFD700;padding:2px 0;border-bottom:1px solid #2A1A1A}' +
+            '#vibe-timeoff-panel .failed-report .failed-item:last-child{border-bottom:none}'
         );
 
         var panel = document.createElement('div');
@@ -364,7 +481,7 @@
         var header = document.createElement('div');
         header.className = 'panel-header';
         var title = document.createElement('h3');
-        title.textContent = '⚡ Stitch Time Off v1.0';
+        title.textContent = '⚡ Stitch Time Off v1.1';
         header.appendChild(title);
         var controls = document.createElement('div');
         controls.className = 'controls';
@@ -382,7 +499,7 @@
 
         var infoBox = document.createElement('div');
         infoBox.className = 'info-box';
-        infoBox.innerHTML = '📋 <strong>Paste from Excel</strong> (tab-separated):<br><code>login</code> <code>category</code> <code>startDate</code> <code>endDate</code> <code>startTime</code> <code>endTime</code> <code>reportingTime</code> <code>comments</code><br>📌 Categories: <code>Infraction</code> or <code>Outage Pending - VCC</code><br>📌 Dates: <code>YYYY/MM/DD</code> | Times: <code>HH:MM</code>';
+        infoBox.innerHTML = '📋 <strong>Paste from Excel</strong> (tab-separated):<br><code>login</code> <code>category</code> <code>startDate</code> <code>endDate</code> <code>startTime</code> <code>endTime</code><br>📌 Categories: <code>Infraction</code> or <code>Outage Pending - VCC</code><br>📌 Dates: <code>YYYY/MM/DD</code> | Times: <code>HH:MM</code><br>';
         body.appendChild(infoBox);
 
         var taLabel = document.createElement('label');
@@ -390,7 +507,7 @@
         body.appendChild(taLabel);
         var textarea = document.createElement('textarea');
         textarea.id = 'vibe-data-input';
-        textarea.placeholder = 'login\tcategory\tstartDate\tendDate\tstartTime\tendTime\treportingTime\tcomments';
+        textarea.placeholder = 'login\tcategory\tstartDate\tendDate\tstartTime\tendTime';
         body.appendChild(textarea);
 
         var btnRow1 = document.createElement('div');
@@ -428,7 +545,8 @@
             { id: 'stat-total', label: 'Total', color: '#FF9900' },
             { id: 'stat-done', label: 'Completed', color: '#4CAF50' },
             { id: 'stat-fail', label: 'Failed', color: '#FF5252' },
-            { id: 'stat-pending', label: 'Pending', color: '#64B5F6' }
+            { id: 'stat-pending', label: 'Pending', color: '#64B5F6' },
+            { id: 'stat-skipped', label: 'Skipped', color: '#FFD700' }
         ].forEach(function (s) {
             var item = document.createElement('div');
             item.className = 'stat-item';
@@ -462,6 +580,12 @@
         logArea.className = 'log-area';
         logArea.id = 'vibe-log';
         body.appendChild(logArea);
+
+        // Failed records report section
+        var failedReport = document.createElement('div');
+        failedReport.className = 'failed-report';
+        failedReport.id = 'vibe-failed-report';
+        body.appendChild(failedReport);
 
         panel.appendChild(body);
         document.body.appendChild(panel);
@@ -517,6 +641,17 @@
             var match = text.match(/^\[([^\]]+)\]\s*(.*)$/);
             csvRows.push((match ? match[1] : '') + ',' + type + ',"' + (match ? match[2] : text).replace(/"/g, '""') + '"');
         });
+
+        // Append failed records summary to CSV
+        if (failedRecords.length > 0) {
+            csvRows.push('');
+            csvRows.push('--- FAILED/SKIPPED RECORDS ---');
+            csvRows.push('Row,Login,Category,Reason');
+            failedRecords.forEach(function (fr) {
+                csvRows.push(fr.row + ',' + fr.login + ',' + fr.category + ',"' + fr.reason.replace(/"/g, '""') + '"');
+            });
+        }
+
         var blob = new Blob([csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
         var url = URL.createObjectURL(blob);
         var fn = 'TimeOff_Log_' + new Date().toISOString().slice(0, 10) + '.csv';
@@ -525,6 +660,25 @@
         document.body.appendChild(link); link.click(); document.body.removeChild(link);
         URL.revokeObjectURL(url);
         addLog('📥 Exported: ' + fn, 'success');
+    }
+
+    // ============================================================
+    // 📊 SHOW FAILED RECORDS REPORT
+    // ============================================================
+
+    function showFailedReport() {
+        var reportDiv = document.getElementById('vibe-failed-report');
+        if (failedRecords.length === 0) {
+            reportDiv.style.display = 'none';
+            return;
+        }
+
+        var html = '<h4>⚠️ Failed/Skipped Records (' + failedRecords.length + ')</h4>';
+        failedRecords.forEach(function (fr) {
+            html += '<div class="failed-item">Row ' + fr.row + ' — <strong>' + fr.login + '</strong> | ' + fr.category + ' | ' + fr.dates + '<br>↳ Reason: ' + fr.reason + '</div>';
+        });
+        reportDiv.innerHTML = html;
+        reportDiv.style.display = 'block';
     }
 
     // ============================================================
@@ -541,6 +695,7 @@
             if (cols[0].toLowerCase() === 'login') continue;
             if (cols.length < 6) { addLog('⚠️ Row ' + (i + 1) + ' skipped (need 6+ cols)', 'warn'); continue; }
             records.push({
+                row: i + 1,
                 login: (cols[0] || '').trim(),
                 category: (cols[1] || '').trim(),
                 startDate: (cols[2] || '').trim(),
@@ -556,6 +711,8 @@
 
     function validateData() {
         document.getElementById('vibe-log').innerHTML = '';
+        document.getElementById('vibe-failed-report').style.display = 'none';
+        failedRecords = [];
         var records = parseData();
         if (records.length === 0) { addLog('❌ No records.', 'error'); document.getElementById('vibe-start').disabled = true; return; }
         var hasErrors = false;
@@ -567,13 +724,14 @@
             if (!/^\d{4}\/\d{2}\/\d{2}$/.test(r.endDate)) errors.push('endDate');
             if (!/^\d{2}:\d{2}$/.test(r.startTime)) errors.push('startTime');
             if (!/^\d{2}:\d{2}$/.test(r.endTime)) errors.push('endTime');
-            if (errors.length > 0) { hasErrors = true; addLog('❌ Row ' + (i + 1) + ': ' + errors.join(', '), 'error'); }
-            else addLog('✅ Row ' + (i + 1) + ': ' + r.login + ' | ' + r.category + ' | ' + r.startDate + ' | ' + r.startTime + '-' + r.endTime, 'success');
+            if (errors.length > 0) { hasErrors = true; addLog('❌ Row ' + r.row + ': ' + errors.join(', '), 'error'); }
+            else addLog('✅ Row ' + r.row + ': ' + r.login + ' | ' + r.category + ' | ' + r.startDate + ' | ' + r.startTime + '-' + r.endTime, 'success');
         });
         document.getElementById('stat-total').textContent = records.length;
         document.getElementById('stat-pending').textContent = records.length;
         document.getElementById('stat-done').textContent = '0';
         document.getElementById('stat-fail').textContent = '0';
+        document.getElementById('stat-skipped').textContent = '0';
         document.getElementById('vibe-progress').style.width = '0%';
         if (!hasErrors) { addLog('🎯 ' + records.length + ' ready.', 'process'); document.getElementById('vibe-start').disabled = false; }
         else { addLog('⚠️ Fix errors.', 'warn'); document.getElementById('vibe-start').disabled = true; }
@@ -612,9 +770,19 @@
             addLog('  ✅ Show Schedule', 'success');
             await delay(DELAY_AFTER_SCHEDULE);
 
-            // 6: Custom Duration (Focus + Space + ArrowDown + Enter)
-            var durOk = await selectCustomDuration();
-            if (!durOk) addLog('  ⚠️ Custom Duration may not have set', 'warn');
+            // 6: Custom Duration — WITH RETRY LOGIC
+            var durOk = await selectCustomDurationWithRetry(record, index, total);
+            if (!durOk) {
+                // Record failed after retries — skip it
+                failedRecords.push({
+                    row: record.row,
+                    login: record.login,
+                    category: record.category,
+                    dates: record.startDate + ' → ' + record.endDate,
+                    reason: 'Custom Duration failed after ' + MAX_CUSTOM_DURATION_RETRIES + ' attempts'
+                });
+                return 'skipped';
+            }
             await delay(DELAY_BETWEEN_STEPS);
 
             // 7: Start Time
@@ -632,7 +800,6 @@
             var rtOk = await selectReportingTime(rtValue);
             if (!rtOk) addLog('  ⚠️ Reporting Time not set', 'warn');
             await delay(DELAY_BETWEEN_STEPS);
-
 
             // 10: Comments (optional)
             if (record.comments) {
@@ -653,10 +820,17 @@
             addLog('  🚀 SUBMITTED → ' + record.login, 'success');
             await delay(DELAY_AFTER_SUBMIT);
 
-            return true;
+            return 'success';
         } catch (error) {
             addLog('  💥 ERROR: ' + error.message, 'error');
-            return false;
+            failedRecords.push({
+                row: record.row,
+                login: record.login,
+                category: record.category,
+                dates: record.startDate + ' → ' + record.endDate,
+                reason: error.message
+            });
+            return 'failed';
         }
     }
 
@@ -668,22 +842,36 @@
         if (isProcessing) return;
         isProcessing = true;
         shouldStop = false;
+        failedRecords = [];
         var records = parseData();
         var total = records.length;
-        var done = 0, fail = 0;
+        var done = 0, fail = 0, skipped = 0;
         document.getElementById('vibe-start').disabled = true;
         document.getElementById('vibe-stop').disabled = false;
         document.getElementById('vibe-data-input').disabled = true;
+        document.getElementById('vibe-failed-report').style.display = 'none';
+        document.getElementById('stat-skipped').textContent = '0';
         addLog('🤖 Processing ' + total + ' record(s)...', 'process');
 
         for (var i = 0; i < records.length; i++) {
             if (shouldStop) { addLog('⛔ Stopped at ' + (i + 1) + '/' + total, 'warn'); break; }
-            var success = await processRecord(records[i], i, total);
-            if (success) done++; else fail++;
+
+            var result = await processRecord(records[i], i, total);
+
+            if (result === 'success') {
+                done++;
+            } else if (result === 'skipped') {
+                skipped++;
+                addLog('  ⏭️ Skipped → ' + records[i].login + ' (will retry manually)', 'warn');
+            } else {
+                fail++;
+            }
+
             document.getElementById('stat-done').textContent = done;
             document.getElementById('stat-fail').textContent = fail;
-            document.getElementById('stat-pending').textContent = total - done - fail;
-            document.getElementById('vibe-progress').style.width = (((done + fail) / total) * 100) + '%';
+            document.getElementById('stat-skipped').textContent = skipped;
+            document.getElementById('stat-pending').textContent = total - done - fail - skipped;
+            document.getElementById('vibe-progress').style.width = (((done + fail + skipped) / total) * 100) + '%';
 
             // Reset via Edit for next record
             if (i < records.length - 1 && !shouldStop) {
@@ -693,7 +881,21 @@
             }
         }
 
-        addLog('🏁 DONE: ✅ ' + done + ' | ❌ ' + fail + ' | Total: ' + total, 'process');
+        // Final summary
+        addLog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'process');
+        addLog('🏁 DONE: ✅ ' + done + ' | ❌ ' + fail + ' | ⏭️ ' + skipped + ' | Total: ' + total, 'process');
+
+        if (failedRecords.length > 0) {
+            addLog('', 'info');
+            addLog('⚠️ FAILED/SKIPPED RECORDS:', 'error');
+            failedRecords.forEach(function (fr) {
+                addLog('  Row ' + fr.row + ': ' + fr.login + ' (' + fr.category + ') — ' + fr.reason, 'error');
+            });
+            showFailedReport();
+        } else {
+            addLog('🎉 All records processed successfully!', 'success');
+        }
+
         isProcessing = false;
         document.getElementById('vibe-start').disabled = false;
         document.getElementById('vibe-stop').disabled = true;
@@ -706,9 +908,7 @@
 
     setTimeout(function () {
         createPanel();
-        addLog('🟢 v1.0 ready — All dropdowns tested & confirmed', 'info');
         addLog('💡 Paste data, Validate, then Process.', 'info');
     }, 2000);
 
 })();
-
