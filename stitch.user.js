@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stitch Time Off Bot
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.6
 // @description  UI Panel to automate Create Time Off in Amazon Vibe
 // @author       Yalnunez
 // @match        https://vibe.a2z.com/*
@@ -11,18 +11,18 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-(function () {
+(async function () {
     'use strict';
 
     // ============================================================
     // ⚙️ CONFIG
     // ============================================================
     var DELAY_BETWEEN_STEPS = 1000;
-    var DELAY_AFTER_SCHEDULE = 2000;
+    var DELAY_AFTER_SCHEDULE = 3000;
     var DELAY_AFTER_SUBMIT = 3000;
-    var DELAY_AFTER_EDIT = 2000;
-    var DELAY_DROPDOWN_OPEN = 2000;
-    var DELAY_DROPDOWN_FILTER = 2000;
+    var DELAY_AFTER_EDIT = 3000;
+    var DELAY_DROPDOWN_OPEN = 1000;
+    var DELAY_DROPDOWN_FILTER = 1000;
     var MAX_CUSTOM_DURATION_RETRIES = 2;
     var isProcessing = false;
     var shouldStop = false;
@@ -32,52 +32,104 @@
     // 🛡️ ANTI-THROTTLE: Keep timers alive in background tabs
     // ============================================================
     // Browsers throttle setTimeout/setInterval in background tabs.
-    // Strategy: try Web Worker first; if CSP blocks it, fall back
-    // to MessageChannel (not throttled). Only patch setTimeout
-    // AFTER confirming the alternative timer actually works.
+    // Strategy: try Web Worker first; if CSP blocks it, fall back to
+    // MessageChannel. IMPORTANT: on some sites (confirmed on Vibe) a
+    // CSP-blocked `new Worker(blob:...)` does NOT throw a catchable JS
+    // exception — the constructor call "succeeds" but the worker is
+    // silently killed by the browser, so it never responds to messages.
+    // A try/catch alone is NOT enough to detect this. We confirm the
+    // worker is actually alive with a handshake ping before trusting it;
+    // if it doesn't answer in time, we discard it and fall back.
 
-    (function installAntiThrottle() {
+    async function installAntiThrottle() {
         var _nativeSetTimeout = window.setTimeout.bind(window);
         var _nativeClearTimeout = window.clearTimeout.bind(window);
         var _nativeSetInterval = window.setInterval.bind(window);
         var _nativeClearInterval = window.clearInterval.bind(window);
 
-        // --- MessageChannel-based anti-throttle ---
-        // MessageChannel.port.postMessage is NOT throttled in background
-        // tabs, unlike setTimeout. We use it to create a fast timer.
         var pendingCallbacks = {};
         var nextTimerId = 1;
-        var channel = new MessageChannel();
+        var timerWorker = null;
+        var handshakeConfirmed = false;
 
-        channel.port1.onmessage = function (evt) {
-            var id = evt.data.id;
-            if (pendingCallbacks[id]) {
-                var cb = pendingCallbacks[id];
-                delete pendingCallbacks[id];
-                cb();
+        // --- Strategy 1: real Web Worker timer (proven in production by ---
+        // --- the Heimdall bot on this same domain family) ---
+        // A Worker runs on its own thread. Its internal setTimeout is NOT
+        // subject to background-tab throttling, AND — unlike setTimeout or
+        // MessageChannel on the main thread — it is NOT affected when
+        // Chrome fully FREEZES/suspends the page's main thread after the
+        // tab has been minimized or backgrounded for a while.
+        try {
+            var workerBlob = new Blob([
+                'self.onmessage = function (e) {' +
+                '  setTimeout(function () { self.postMessage(e.data); }, e.data.ms);' +
+                '};'
+            ], { type: 'application/javascript' });
+            var workerURL = URL.createObjectURL(workerBlob);
+            timerWorker = new Worker(workerURL);
+            timerWorker.onmessage = function (evt) {
+                var id = evt.data.id;
+                if (id === '__handshake__') { handshakeConfirmed = true; return; }
+                if (pendingCallbacks[id]) {
+                    var cb = pendingCallbacks[id];
+                    delete pendingCallbacks[id];
+                    cb();
+                }
+            };
+            timerWorker.onerror = function () { timerWorker = null; };
+        } catch (e) {
+            timerWorker = null; // CSP blocked Workers synchronously — fall back below
+        }
+
+        if (timerWorker) {
+            // Handshake: wait up to 500ms for the worker to prove it's
+            // actually alive. If CSP silently killed it, this never resolves.
+            timerWorker.postMessage({ id: '__handshake__', ms: 0 });
+            await new Promise(function (resolve) {
+                _nativeSetTimeout(resolve, 500);
+            });
+            if (!handshakeConfirmed) {
+                try { timerWorker.terminate(); } catch (e2) { /* no-op */ }
+                timerWorker = null;
             }
-        };
-        channel.port1.start();
-        channel.port2.start();
+        }
 
-        // Patched setTimeout: uses native setTimeout for the delay,
-        // but fires the callback via MessageChannel so it isn't
-        // delayed further by background-tab throttling.
+        // --- Strategy 2 (fallback, used if CSP blocks or kills the Worker): ---
+        // --- MessageChannel-based anti-throttle ---
+        // MessageChannel.port.postMessage beats setTimeout's background-tab
+        // *throttling*, but it still runs on the main thread, so — unlike a
+        // Worker — it will NOT survive a full tab freeze when minimized.
+        var channel = timerWorker ? null : new MessageChannel();
+        if (channel) {
+            channel.port1.onmessage = function (evt) {
+                var id = evt.data.id;
+                if (pendingCallbacks[id]) {
+                    var cb = pendingCallbacks[id];
+                    delete pendingCallbacks[id];
+                    cb();
+                }
+            };
+            channel.port1.start();
+            channel.port2.start();
+        }
+
         window.setTimeout = function stitchSetTimeout(fn, delayMs) {
             if (typeof fn !== 'function') {
                 return _nativeSetTimeout(fn, delayMs);
             }
             delayMs = delayMs || 0;
             var id = nextTimerId++;
-
             pendingCallbacks[id] = fn;
-            // Use native setTimeout for the delay portion, then
-            // hand off to MessageChannel for the actual callback
-            _nativeSetTimeout(function () {
-                if (pendingCallbacks[id]) {
-                    channel.port2.postMessage({ id: id });
-                }
-            }, delayMs);
+
+            if (timerWorker) {
+                timerWorker.postMessage({ id: id, ms: delayMs });
+            } else {
+                _nativeSetTimeout(function () {
+                    if (pendingCallbacks[id]) {
+                        channel.port2.postMessage({ id: id });
+                    }
+                }, delayMs);
+            }
             return id;
         };
 
@@ -86,8 +138,41 @@
             _nativeClearTimeout(id);
         };
 
-        console.log('[Stitch] 🛡️ Anti-throttle installed (MessageChannel) — background tabs supported');
-    })();
+        // --- setInterval/clearInterval patch ---
+        // waitForElement() and other polling code use setInterval directly.
+        // Rebuilt as a self-rescheduling chain of the patched setTimeout
+        // above, so it automatically inherits whichever strategy (Worker or
+        // MessageChannel) ended up active.
+        var intervalCancelled = {};
+
+        window.setInterval = function stitchSetInterval(fn, delayMs) {
+            if (typeof fn !== 'function') {
+                return _nativeSetInterval(fn, delayMs);
+            }
+            delayMs = delayMs || 0;
+            var id = nextTimerId++;
+            intervalCancelled[id] = false;
+
+            function tick() {
+                if (intervalCancelled[id]) return;
+                fn();
+                if (!intervalCancelled[id]) {
+                    window.setTimeout(tick, delayMs);
+                }
+            }
+            window.setTimeout(tick, delayMs);
+            return id;
+        };
+
+        window.clearInterval = function stitchClearInterval(id) {
+            intervalCancelled[id] = true;
+            _nativeClearInterval(id);
+        };
+
+        console.log('[Stitch] 🛡️ Anti-throttle installed (' + (timerWorker ? 'Web Worker, handshake confirmed' : 'MessageChannel fallback') + ') — background/minimized tabs + setInterval supported');
+    }
+
+    await installAntiThrottle();
 
     // ============================================================
     // 🛠️ UTILITIES
@@ -198,7 +283,7 @@
     // For dropdowns WITH search combobox (Category, Reporting Time)
     // ============================================================
 
-    async function selectDropdownWithSearch(triggerFinder, optionText, label) {
+    async function selectDropdownWithSearch(triggerFinder, optionText, label, skipVerify) {
         var triggerBtn = triggerFinder();
         if (!triggerBtn) {
             addLog('  ❌ ' + label + ' trigger not found', 'error');
@@ -240,6 +325,14 @@
         searchInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
         await delay(800);
 
+        // Reporting Time (skipVerify = true) never needs to be checked —
+        // it is not functionally required, so we fire the selection and
+        // move on without verifying/warning about it.
+        if (skipVerify) {
+            addLog('  ✅ ' + label + ': "' + optionText + '" sent (not verified)', 'success');
+            return true;
+        }
+
         var verifyBtn = triggerFinder();
         if (verifyBtn) {
             var selectedText = verifyBtn.textContent.trim();
@@ -247,9 +340,11 @@
                 addLog('  ✅ ' + label + ': "' + optionText + '" selected', 'success');
                 return true;
             } else {
-                addLog('  ⚠️ ' + label + ' shows: "' + selectedText + '"', 'warn');
+                addLog('  ❌ ' + label + ' mismatch — expected "' + optionText + '" but shows: "' + selectedText + '"', 'error');
+                return false;
             }
         }
+        addLog('  ⚠️ ' + label + ' could not be verified (trigger not found after selection)', 'warn');
         return true;
     }
 
@@ -403,7 +498,8 @@
                 return null;
             },
             timeValue,
-            'Reporting Time'
+            'Reporting Time',
+            true // skipVerify — Reporting Time does not need to be checked
         );
     }
 
@@ -481,7 +577,7 @@
         var header = document.createElement('div');
         header.className = 'panel-header';
         var title = document.createElement('h3');
-        title.textContent = '⚡ Stitch Time Off v1.1';
+        title.textContent = '⚡ Stitch Time Off v1.6';
         header.appendChild(title);
         var controls = document.createElement('div');
         controls.className = 'controls';
@@ -499,7 +595,7 @@
 
         var infoBox = document.createElement('div');
         infoBox.className = 'info-box';
-        infoBox.innerHTML = '📋 <strong>Paste from Excel</strong> (tab-separated):<br><code>login</code> <code>category</code> <code>startDate</code> <code>endDate</code> <code>startTime</code> <code>endTime</code><br>📌 Categories: <code>Infraction</code> or <code>Outage Pending - VCC</code><br>📌 Dates: <code>YYYY/MM/DD</code> | Times: <code>HH:MM</code><br>';
+        infoBox.innerHTML = '📋 <strong>Paste from Excel</strong> (tab-separated):<br><code>login</code> <code>category</code> <code>startDate</code> <code>endDate</code> <code>startTime</code> <code>endTime</code><br>📌 Categories: <code>Infraction</code>, <code>Outage Pending - VCC</code>, <code>HR Other</code> or <code>Sick day</code><br>📌 Dates: <code>YYYY/MM/DD</code> | Times: <code>HH:MM</code><br>⏱️ Reporting Time is always fixed to 01:00 — not read from pasted data.<br>🏖️ Sick day records skip Custom Duration + Start/End Time (not applicable in Vibe for this category).<br>';
         body.appendChild(infoBox);
 
         var taLabel = document.createElement('label');
@@ -694,6 +790,21 @@
             var cols = lines[i].split('\t');
             if (cols[0].toLowerCase() === 'login') continue;
             if (cols.length < 6) { addLog('⚠️ Row ' + (i + 1) + ' skipped (need 6+ cols)', 'warn'); continue; }
+
+            // Reporting Time is always fixed to "01:00" — never read from
+            // pasted data (set later in processRecord). This also removes the
+            // old bug where pasting straight from LILO's "Infractions" tab
+            // (A:H = login, category, startDate, endDate, startTime, endTime,
+            // Duration, comments) fed the "Duration" column into Reporting Time.
+            //
+            // Comments column depends on how many columns were pasted:
+            //  - 8 cols (full Infractions A:H paste): col 7 (idx 6) = Duration (ignored), col 8 (idx 7) = comments
+            //  - 7 cols (manual paste w/ comments, no Duration): col 7 (idx 6) = comments
+            //  - 6 cols: no comments
+            var comments = '';
+            if (cols.length >= 8) comments = (cols[7] || '').trim();
+            else if (cols.length === 7) comments = (cols[6] || '').trim();
+
             records.push({
                 row: i + 1,
                 login: (cols[0] || '').trim(),
@@ -702,8 +813,7 @@
                 endDate: (cols[3] || '').trim(),
                 startTime: (cols[4] || '').trim(),
                 endTime: (cols[5] || '').trim(),
-                reportingTime: (cols[6] || '').trim(),
-                comments: (cols[7] || '').trim()
+                comments: comments
             });
         }
         return records;
@@ -719,7 +829,8 @@
         records.forEach(function (r, i) {
             var errors = [];
             if (!r.login) errors.push('login');
-            if (r.category !== 'Infraction' && r.category !== 'Outage Pending - VCC') errors.push('category');
+            var validCategories = ['infraction', 'outage pending - vcc', 'hr other', 'sick day'];
+            if (validCategories.indexOf(r.category.toLowerCase()) === -1) errors.push('category');
             if (!/^\d{4}\/\d{2}\/\d{2}$/.test(r.startDate)) errors.push('startDate');
             if (!/^\d{4}\/\d{2}\/\d{2}$/.test(r.endDate)) errors.push('endDate');
             if (!/^\d{2}:\d{2}$/.test(r.startTime)) errors.push('startTime');
@@ -770,34 +881,43 @@
             addLog('  ✅ Show Schedule', 'success');
             await delay(DELAY_AFTER_SCHEDULE);
 
-            // 6: Custom Duration — WITH RETRY LOGIC
-            var durOk = await selectCustomDurationWithRetry(record, index, total);
-            if (!durOk) {
-                // Record failed after retries — skip it
-                failedRecords.push({
-                    row: record.row,
-                    login: record.login,
-                    category: record.category,
-                    dates: record.startDate + ' → ' + record.endDate,
-                    reason: 'Custom Duration failed after ' + MAX_CUSTOM_DURATION_RETRIES + ' attempts'
-                });
-                return 'skipped';
+            // 6-8: Custom Duration + Start/End Time — SKIPPED for "Sick day"
+            // Vibe has no Custom Duration option for Sick day (selecting/
+            // expecting one errors out), so for this category we go straight
+            // from Show Schedule to Reporting Time.
+            var isSickDay = record.category.toLowerCase() === 'sick day';
+
+            if (isSickDay) {
+                addLog('  🏖️ Sick day: skipping Custom Duration + Start/End Time', 'info');
+            } else {
+                // 6: Custom Duration — WITH RETRY LOGIC
+                var durOk = await selectCustomDurationWithRetry(record, index, total);
+                if (!durOk) {
+                    // Record failed after retries — skip it
+                    failedRecords.push({
+                        row: record.row,
+                        login: record.login,
+                        category: record.category,
+                        dates: record.startDate + ' → ' + record.endDate,
+                        reason: 'Custom Duration failed after ' + MAX_CUSTOM_DURATION_RETRIES + ' attempts'
+                    });
+                    return 'skipped';
+                }
+                await delay(DELAY_BETWEEN_STEPS);
+
+                // 7: Start Time
+                await fillField('Start Time', record.startTime);
+                addLog('  ✅ Start Time: ' + record.startTime, 'success');
+                await delay(DELAY_BETWEEN_STEPS);
+
+                // 8: End Time
+                await fillField('End Time', record.endTime);
+                addLog('  ✅ End Time: ' + record.endTime, 'success');
+                await delay(DELAY_BETWEEN_STEPS);
             }
-            await delay(DELAY_BETWEEN_STEPS);
 
-            // 7: Start Time
-            await fillField('Start Time', record.startTime);
-            addLog('  ✅ Start Time: ' + record.startTime, 'success');
-            await delay(DELAY_BETWEEN_STEPS);
-
-            // 8: End Time
-            await fillField('End Time', record.endTime);
-            addLog('  ✅ End Time: ' + record.endTime, 'success');
-            await delay(DELAY_BETWEEN_STEPS);
-
-            // 9: Reporting Time (Approach B — has search) — always 01:00
-            var rtValue = record.reportingTime || '01:00';
-            var rtOk = await selectReportingTime(rtValue);
+            // 9: Reporting Time (Approach B — has search) — always fixed to 01:00
+            var rtOk = await selectReportingTime('01:00');
             if (!rtOk) addLog('  ⚠️ Reporting Time not set', 'warn');
             await delay(DELAY_BETWEEN_STEPS);
 
@@ -877,7 +997,22 @@
             if (i < records.length - 1 && !shouldStop) {
                 addLog('⏳ Resetting via Edit...', 'info');
                 var editOk = await clickEditToReset();
-                if (!editOk) { addLog('❌ Reset failed. Stopping.', 'error'); break; }
+                if (!editOk) {
+                    addLog('❌ Reset failed. Stopping — remaining records were NOT attempted.', 'error');
+                    for (var r = i + 1; r < records.length; r++) {
+                        fail++;
+                        failedRecords.push({
+                            row: records[r].row,
+                            login: records[r].login,
+                            category: records[r].category,
+                            dates: records[r].startDate + ' → ' + records[r].endDate,
+                            reason: 'Batch stopped: form reset (Edit) failed after a previous record'
+                        });
+                    }
+                    document.getElementById('stat-fail').textContent = fail;
+                    document.getElementById('stat-pending').textContent = 0;
+                    break;
+                }
             }
         }
 
