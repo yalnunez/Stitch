@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stitch Time Off Bot
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.8
 // @description  UI Panel to automate Create Time Off in Amazon Vibe
 // @author       Yalnunez
 // @match        https://vibe.a2z.com/*
@@ -265,6 +265,26 @@
         await delay(300);
     }
 
+    // Same as fillField, but tolerant: if the field simply does not exist
+    // on the current form (some categories' Vibe layout omits Start/End
+    // Time), skip it gracefully instead of waiting out a timeout and
+    // failing the whole record. Returns true if filled, false if skipped.
+    async function fillFieldIfPresent(labelText, value) {
+        var input = findInputByLabel(labelText);
+        if (!input) {
+            addLog('  ℹ️ ' + labelText + ' not present for this category — skipping', 'info');
+            return false;
+        }
+        input.focus();
+        await delay(150);
+        setNativeValue(input, '');
+        await delay(100);
+        setNativeValue(input, value);
+        await delay(300);
+        addLog('  ✅ ' + labelText + ': ' + value, 'success');
+        return true;
+    }
+
     async function clickBtn(text) {
         var btn = await waitForElement(
             function () { return findButtonByText(text); },
@@ -383,14 +403,18 @@
         }
 
         if (!triggerBtn) {
-            addLog('  ⚠️ Duration trigger not found', 'warn');
-            return false;
+            // This category's form has no Duration selector at all (e.g. "HR
+            // Other" in Vibe goes straight to Daily schedules' Start/End
+            // Time, no Full Day/Half Day/Custom Duration toggle shown) --
+            // this is NOT a failure, just means there's nothing to select.
+            addLog('  ℹ️ Duration trigger not present for this category — nothing to select', 'info');
+            return 'not_found';
         }
 
         // Already Custom Duration?
         if (triggerBtn.textContent.trim().toLowerCase().includes('custom')) {
             addLog('  ✅ Duration: already "Custom Duration"', 'success');
-            return true;
+            return 'success';
         }
 
         // Step 1: Focus the button
@@ -425,17 +449,24 @@
 
         if (verifyBtn && verifyBtn.textContent.trim().toLowerCase().includes('custom')) {
             addLog('  ✅ Duration: "Custom Duration" selected', 'success');
-            return true;
+            return 'success';
         } else {
             addLog('  ❌ Duration still shows: "' + (verifyBtn ? verifyBtn.textContent.trim() : 'unknown') + '"', 'error');
-            return false;
+            return 'failed';
         }
     }
 
     async function selectCustomDurationWithRetry(record, index, total) {
         for (var attempt = 1; attempt <= MAX_CUSTOM_DURATION_RETRIES; attempt++) {
-            var success = await attemptSelectCustomDuration();
-            if (success) return true;
+            var result = await attemptSelectCustomDuration();
+
+            if (result === 'not_found') {
+                // Nothing to select for this category -- skip straight to
+                // Start/End Time instead of retrying a button that will
+                // never appear.
+                return 'not_found';
+            }
+            if (result === 'success') return 'success';
 
             addLog('  🔁 Custom Duration failed (attempt ' + attempt + '/' + MAX_CUSTOM_DURATION_RETRIES + ') — resetting via Edit...', 'warn');
 
@@ -443,7 +474,7 @@
             var editOk = await clickEditToReset();
             if (!editOk) {
                 addLog('  ❌ Edit reset failed during retry', 'error');
-                return false;
+                return 'failed';
             }
 
             // If we still have retries left, re-fill the form up to Show Schedule
@@ -471,14 +502,14 @@
                     await delay(DELAY_AFTER_SCHEDULE);
                 } catch (e) {
                     addLog('  ❌ Re-fill failed: ' + e.message, 'error');
-                    return false;
+                    return 'failed';
                 }
             }
         }
 
         // All retries exhausted
         addLog('  ❌ Custom Duration failed after ' + MAX_CUSTOM_DURATION_RETRIES + ' attempts — skipping record', 'error');
-        return false;
+        return 'failed';
     }
 
     // ============================================================
@@ -577,7 +608,7 @@
         var header = document.createElement('div');
         header.className = 'panel-header';
         var title = document.createElement('h3');
-        title.textContent = '⚡ Stitch Time Off v1.6';
+        title.textContent = '⚡ Stitch Time Off v1.8';
         header.appendChild(title);
         var controls = document.createElement('div');
         controls.className = 'controls';
@@ -595,7 +626,7 @@
 
         var infoBox = document.createElement('div');
         infoBox.className = 'info-box';
-        infoBox.innerHTML = '📋 <strong>Paste from Excel</strong> (tab-separated):<br><code>login</code> <code>category</code> <code>startDate</code> <code>endDate</code> <code>startTime</code> <code>endTime</code><br>📌 Categories: <code>Infraction</code>, <code>Outage Pending - VCC</code>, <code>HR Other</code> or <code>Sick day</code><br>📌 Dates: <code>YYYY/MM/DD</code> | Times: <code>HH:MM</code><br>⏱️ Reporting Time is always fixed to 01:00 — not read from pasted data.<br>🏖️ Sick day records skip Custom Duration + Start/End Time (not applicable in Vibe for this category).<br>';
+        infoBox.innerHTML = '📋 <strong>Paste from Excel</strong> (tab-separated):<br><code>login</code> <code>category</code> <code>startDate</code> <code>endDate</code> <code>startTime</code> <code>endTime</code><br>📌 Categories: <code>Infraction</code>, <code>Outage Pending - VCC</code>, <code>HR Other</code> or <code>Sick day</code><br>📌 Dates: <code>YYYY/MM/DD</code> | Times: <code>HH:MM</code><br>⏱️ Reporting Time is always fixed to 01:00 — not read from pasted data.<br>🏖️ Custom Duration and Start/End Time are only filled when Vibe actually shows them for that category — missing controls are skipped automatically, no category-specific setup needed.<br>';
         body.appendChild(infoBox);
 
         var taLabel = document.createElement('label');
@@ -881,40 +912,41 @@
             addLog('  ✅ Show Schedule', 'success');
             await delay(DELAY_AFTER_SCHEDULE);
 
-            // 6-8: Custom Duration + Start/End Time — SKIPPED for "Sick day"
-            // Vibe has no Custom Duration option for Sick day (selecting/
-            // expecting one errors out), so for this category we go straight
-            // from Show Schedule to Reporting Time.
-            var isSickDay = record.category.toLowerCase() === 'sick day';
+            // 6-8: Custom Duration + Start/End Time — SAME tolerant handling
+            // for ALL categories (Infraction, Outage Pending - VCC, HR Other,
+            // Sick day). Vibe shows a different subset of controls depending
+            // on category, so every step here is "use it if it's there,
+            // otherwise skip it and move on" -- nothing is hardcoded to a
+            // specific category name.
 
-            if (isSickDay) {
-                addLog('  🏖️ Sick day: skipping Custom Duration + Start/End Time', 'info');
-            } else {
-                // 6: Custom Duration — WITH RETRY LOGIC
-                var durOk = await selectCustomDurationWithRetry(record, index, total);
-                if (!durOk) {
-                    // Record failed after retries — skip it
-                    failedRecords.push({
-                        row: record.row,
-                        login: record.login,
-                        category: record.category,
-                        dates: record.startDate + ' → ' + record.endDate,
-                        reason: 'Custom Duration failed after ' + MAX_CUSTOM_DURATION_RETRIES + ' attempts'
-                    });
-                    return 'skipped';
-                }
-                await delay(DELAY_BETWEEN_STEPS);
-
-                // 7: Start Time
-                await fillField('Start Time', record.startTime);
-                addLog('  ✅ Start Time: ' + record.startTime, 'success');
-                await delay(DELAY_BETWEEN_STEPS);
-
-                // 8: End Time
-                await fillField('End Time', record.endTime);
-                addLog('  ✅ End Time: ' + record.endTime, 'success');
-                await delay(DELAY_BETWEEN_STEPS);
+            // 6: Custom Duration — WITH RETRY LOGIC
+            // 'success' (button found and set) and 'not_found' (no button
+            // for this category) both proceed to Start/End Time. Only
+            // 'failed' (button WAS there but selecting it kept failing even
+            // after retries) skips the record.
+            var durResult = await selectCustomDurationWithRetry(record, index, total);
+            if (durResult === 'failed') {
+                failedRecords.push({
+                    row: record.row,
+                    login: record.login,
+                    category: record.category,
+                    dates: record.startDate + ' → ' + record.endDate,
+                    reason: 'Custom Duration failed after ' + MAX_CUSTOM_DURATION_RETRIES + ' attempts'
+                });
+                return 'skipped';
             }
+            if (durResult === 'not_found') {
+                addLog('  ⏭️ No Duration selector for this category — continuing', 'info');
+            }
+            await delay(DELAY_BETWEEN_STEPS);
+
+            // 7: Start Time — only if this category's form shows it
+            await fillFieldIfPresent('Start Time', record.startTime);
+            await delay(DELAY_BETWEEN_STEPS);
+
+            // 8: End Time — only if this category's form shows it
+            await fillFieldIfPresent('End Time', record.endTime);
+            await delay(DELAY_BETWEEN_STEPS);
 
             // 9: Reporting Time (Approach B — has search) — always fixed to 01:00
             var rtOk = await selectReportingTime('01:00');
