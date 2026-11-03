@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stitch Time Off Bot
 // @namespace    http://tampermonkey.net/
-// @version      1.8
+// @version      1.9
 // @description  UI Panel to automate Create Time Off in Amazon Vibe
 // @author       Yalnunez
 // @match        https://vibe.a2z.com/*
@@ -608,7 +608,7 @@
         var header = document.createElement('div');
         header.className = 'panel-header';
         var title = document.createElement('h3');
-        title.textContent = '⚡ Stitch Time Off v1.8';
+        title.textContent = '⚡ Stitch Time Off v1.9';
         header.appendChild(title);
         var controls = document.createElement('div');
         controls.className = 'controls';
@@ -626,7 +626,7 @@
 
         var infoBox = document.createElement('div');
         infoBox.className = 'info-box';
-        infoBox.innerHTML = '📋 <strong>Paste from Excel</strong> (tab-separated):<br><code>login</code> <code>category</code> <code>startDate</code> <code>endDate</code> <code>startTime</code> <code>endTime</code><br>📌 Categories: <code>Infraction</code>, <code>Outage Pending - VCC</code>, <code>HR Other</code> or <code>Sick day</code><br>📌 Dates: <code>YYYY/MM/DD</code> | Times: <code>HH:MM</code><br>⏱️ Reporting Time is always fixed to 01:00 — not read from pasted data.<br>🏖️ Custom Duration and Start/End Time are only filled when Vibe actually shows them for that category — missing controls are skipped automatically, no category-specific setup needed.<br>';
+        infoBox.innerHTML = '📋 <strong>Paste from Excel</strong> (tab-separated):<br><code>login</code> <code>category</code> <code>startDate</code> <code>endDate</code> <code>startTime</code> <code>endTime</code><br>📌 Categories: <code>Infraction</code>, <code>Outage Pending - VCC</code>, <code>HR Other</code> or <code>Sick day</code><br>📌 Dates: <code>YYYY/MM/DD</code> | Times: <code>HH:MM</code><br>⏱️ Reporting Time is always fixed to 01:00 — not read from pasted data.<br>🏖️ Sick day stays on "Full Day" and skips Custom Duration + Start/End Time. Other categories fill Custom Duration/Start/End Time only when Vibe shows them.<br>📅 Reporting date is always set to the same date as Start Date, for every category.<br>';
         body.appendChild(infoBox);
 
         var taLabel = document.createElement('label');
@@ -912,45 +912,58 @@
             addLog('  ✅ Show Schedule', 'success');
             await delay(DELAY_AFTER_SCHEDULE);
 
-            // 6-8: Custom Duration + Start/End Time — SAME tolerant handling
-            // for ALL categories (Infraction, Outage Pending - VCC, HR Other,
-            // Sick day). Vibe shows a different subset of controls depending
-            // on category, so every step here is "use it if it's there,
-            // otherwise skip it and move on" -- nothing is hardcoded to a
-            // specific category name.
+            // 6-8: Custom Duration + Start/End Time
+            // "Sick day" is a real special case, not just a "button not
+            // found" case: Vibe DOES show the Duration trigger for Sick day,
+            // defaulted to "Full Day" -- and it must STAY on Full Day (never
+            // attempt to switch it to Custom Duration), skipping straight to
+            // Reporting Time with no Start/End Time at all.
+            // The other 3 categories (Infraction, Outage Pending - VCC,
+            // HR Other) use the generic tolerant flow: use the control if
+            // it's there, skip it if it's not.
+            var isSickDay = record.category.toLowerCase() === 'sick day';
 
-            // 6: Custom Duration — WITH RETRY LOGIC
-            // 'success' (button found and set) and 'not_found' (no button
-            // for this category) both proceed to Start/End Time. Only
-            // 'failed' (button WAS there but selecting it kept failing even
-            // after retries) skips the record.
-            var durResult = await selectCustomDurationWithRetry(record, index, total);
-            if (durResult === 'failed') {
-                failedRecords.push({
-                    row: record.row,
-                    login: record.login,
-                    category: record.category,
-                    dates: record.startDate + ' → ' + record.endDate,
-                    reason: 'Custom Duration failed after ' + MAX_CUSTOM_DURATION_RETRIES + ' attempts'
-                });
-                return 'skipped';
+            if (isSickDay) {
+                addLog('  🏖️ Sick day: leaving Duration as "Full Day" — skipping Custom Duration + Start/End Time', 'info');
+            } else {
+                // 6: Custom Duration — WITH RETRY LOGIC
+                // 'success' (button found and set) and 'not_found' (no button
+                // for this category) both proceed to Start/End Time. Only
+                // 'failed' (button WAS there but selecting it kept failing even
+                // after retries) skips the record.
+                var durResult = await selectCustomDurationWithRetry(record, index, total);
+                if (durResult === 'failed') {
+                    failedRecords.push({
+                        row: record.row,
+                        login: record.login,
+                        category: record.category,
+                        dates: record.startDate + ' → ' + record.endDate,
+                        reason: 'Custom Duration failed after ' + MAX_CUSTOM_DURATION_RETRIES + ' attempts'
+                    });
+                    return 'skipped';
+                }
+                if (durResult === 'not_found') {
+                    addLog('  ⏭️ No Duration selector for this category — continuing', 'info');
+                }
+                await delay(DELAY_BETWEEN_STEPS);
+
+                // 7: Start Time — only if this category's form shows it
+                await fillFieldIfPresent('Start Time', record.startTime);
+                await delay(DELAY_BETWEEN_STEPS);
+
+                // 8: End Time — only if this category's form shows it
+                await fillFieldIfPresent('End Time', record.endTime);
+                await delay(DELAY_BETWEEN_STEPS);
             }
-            if (durResult === 'not_found') {
-                addLog('  ⏭️ No Duration selector for this category — continuing', 'info');
-            }
-            await delay(DELAY_BETWEEN_STEPS);
-
-            // 7: Start Time — only if this category's form shows it
-            await fillFieldIfPresent('Start Time', record.startTime);
-            await delay(DELAY_BETWEEN_STEPS);
-
-            // 8: End Time — only if this category's form shows it
-            await fillFieldIfPresent('End Time', record.endTime);
-            await delay(DELAY_BETWEEN_STEPS);
 
             // 9: Reporting Time (Approach B — has search) — always fixed to 01:00
             var rtOk = await selectReportingTime('01:00');
             if (!rtOk) addLog('  ⚠️ Reporting Time not set', 'warn');
+            await delay(DELAY_BETWEEN_STEPS);
+
+            // 9B: Reporting Date (Team manager's notes section) — always set
+            // to the SAME date as Start Date, for every category.
+            await fillFieldIfPresent('Reporting date', record.startDate);
             await delay(DELAY_BETWEEN_STEPS);
 
             // 10: Comments (optional)
