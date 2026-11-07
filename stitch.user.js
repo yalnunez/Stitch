@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stitch Time Off Bot
 // @namespace    http://tampermonkey.net/
-// @version      1.9
+// @version      1.10
 // @description  UI Panel to automate Create Time Off in Amazon Vibe
 // @author       Yalnunez
 // @match        https://vibe.a2z.com/*
@@ -285,6 +285,28 @@
         return true;
     }
 
+    // Safety check: on some accounts, the schedule panel can take up to
+    // ~10s to render Start/End Time after "Show Schedule" -- far beyond the
+    // fixed DELAY_AFTER_SCHEDULE (3s). Without this, a still-loading form
+    // could be misread as "no Duration selector for this category" and the
+    // bot would skip straight past Custom Duration incorrectly. Polls every
+    // 3s, up to maxExtraChecks times, for Start Time or End Time to appear.
+    async function waitForScheduleReady(maxExtraChecks) {
+        maxExtraChecks = maxExtraChecks || 3;
+        if (findInputByLabel('Start Time') || findInputByLabel('End Time')) {
+            return true;
+        }
+        for (var i = 0; i < maxExtraChecks; i++) {
+            addLog('  ⏳ Start/End Time aun no visible -- esperando 3s mas (intento ' + (i + 1) + '/' + maxExtraChecks + ')...', 'warn');
+            await delay(3000);
+            if (findInputByLabel('Start Time') || findInputByLabel('End Time')) {
+                return true;
+            }
+        }
+        addLog('  ℹ️ Start/End Time no aparecio tras espera extendida -- puede que esta categoria no los use', 'info');
+        return false;
+    }
+
     async function clickBtn(text) {
         var btn = await waitForElement(
             function () { return findButtonByText(text); },
@@ -500,6 +522,7 @@
                     await clickBtn('Show Schedule');
                     addLog('  ✅ Show Schedule', 'success');
                     await delay(DELAY_AFTER_SCHEDULE);
+                    await waitForScheduleReady();
                 } catch (e) {
                     addLog('  ❌ Re-fill failed: ' + e.message, 'error');
                     return 'failed';
@@ -608,7 +631,7 @@
         var header = document.createElement('div');
         header.className = 'panel-header';
         var title = document.createElement('h3');
-        title.textContent = '⚡ Stitch Time Off v1.9';
+        title.textContent = '⚡ Stitch Time Off v1.10';
         header.appendChild(title);
         var controls = document.createElement('div');
         controls.className = 'controls';
@@ -926,6 +949,10 @@
             if (isSickDay) {
                 addLog('  🏖️ Sick day: leaving Duration as "Full Day" — skipping Custom Duration + Start/End Time', 'info');
             } else {
+                // Safety check: make sure the schedule panel has actually
+                // finished rendering before touching Custom Duration.
+                await waitForScheduleReady();
+
                 // 6: Custom Duration — WITH RETRY LOGIC
                 // 'success' (button found and set) and 'not_found' (no button
                 // for this category) both proceed to Start/End Time. Only
